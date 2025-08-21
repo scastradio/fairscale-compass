@@ -1,4 +1,4 @@
-// server.js
+// server.js — server-side rendered gauge PNG (no client canvas)
 import express from "express";
 import dotenv from "dotenv";
 import fetch from "node-fetch";
@@ -6,12 +6,16 @@ import { TwitterApi } from "twitter-api-v2";
 import path from "path";
 import crypto from "crypto";
 import cookieParser from "cookie-parser";
+import { fileURLToPath } from "url";
+import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 dotenv.config();
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 const {
   PORT = 3000,
-  SESSION_SECRET = "devsecret", // used to sign cookies
+  SESSION_SECRET = "devsecret",
   TWITTER_CLIENT_ID,
   TWITTER_CLIENT_SECRET,
   CALLBACK_URL,
@@ -47,79 +51,72 @@ const {
   HANDLE_COLOR = "#ffffff",
 } = process.env;
 
-// ---- Env guards -------------------------------------------------------------
+// ---------- helpers ----------
 function required(name) {
   if (!process.env[name]) {
     console.error(`Missing required env var: ${name}`);
     process.exit(1);
   }
 }
-["TWITTER_CLIENT_ID", "TWITTER_CLIENT_SECRET", "CALLBACK_URL", "TWITTERAPI_IO_KEY", "WEBHOOK_URL"].forEach(required);
+["TWITTER_CLIENT_ID","TWITTER_CLIENT_SECRET","CALLBACK_URL","TWITTERAPI_IO_KEY","WEBHOOK_URL"].forEach(required);
 
-// ---- Helpers ----------------------------------------------------------------
 function intish(v, def = 0) {
   const m = String(v ?? "").match(/-?\d+/);
   const n = m ? parseInt(m[0], 10) : NaN;
   return Number.isFinite(n) ? n : def;
 }
 
-// Lightweight cookie “session”
+// logger
+const stamp = () => new Date().toISOString().replace("T"," ").replace("Z","");
+function slog(...args){ console.log(`[${stamp()}]`, ...args); }
+
+// ---------- app ----------
 const COOKIE_NAME = "fx_sess";
 const COOKIE_SECRET = SESSION_SECRET || crypto.randomBytes(32).toString("hex");
 
 const app = express();
 app.use(cookieParser(COOKIE_SECRET));
 app.use("/assets", express.static(path.join(process.cwd(), "assets")));
+app.use(express.json({ limit: "512kb" }));
 
-// Attach req.sess and res.saveSess
+// cookie "session" helpers
 app.use((req, res, next) => {
   let sess = {};
   try {
     const raw = req.signedCookies?.[COOKIE_NAME];
     sess = raw ? JSON.parse(raw) : {};
-  } catch { /* ignore bad cookie */ }
+  } catch {}
   req.sess = sess;
   res.saveSess = (obj) => {
     res.cookie(COOKIE_NAME, JSON.stringify(obj), {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: true,
-      signed: true,
-      path: "/",
-      maxAge: 60 * 60 * 1000, // 1 hour
+      httpOnly: true, sameSite: "lax", secure: true, signed: true, path: "/",
+      maxAge: 60 * 60 * 1000,
     });
   };
   next();
 });
 
-// ---- Twitter OAuth2 client ---------------------------------------------------
+// font
+try {
+  GlobalFonts.registerFromPath(
+    path.join(process.cwd(), "assets/fonts/Manrope-Bold.ttf"),
+    "Manrope"
+  );
+  slog("Font registered: Manrope");
+} catch (e) {
+  slog("Font registration failed (Manrope).", String(e));
+}
+
+// twitter oauth client (OAuth2)
 const oauthClient = new TwitterApi({
   clientId: TWITTER_CLIENT_ID,
   clientSecret: TWITTER_CLIENT_SECRET,
 });
 
-// --- Same-origin proxy for the user's Twitter profile image ------------------
-app.get("/pfp", async (req, res) => {
-  try {
-    const url = req.sess?.profileImageUrl;
-    if (!url) return res.status(404).send("No profile image URL");
-    const r = await fetch(url, { headers: { "User-Agent": "Fairscale-Compass/1.0" }, redirect: "follow" });
-    if (!r.ok) return res.status(502).send("Failed to fetch avatar");
-    const ct = r.headers.get("content-type") || "image/jpeg";
-    const buf = Buffer.from(await r.arrayBuffer());
-    res.setHeader("Content-Type", ct);
-    res.setHeader("Cache-Control", "private, max-age=300");
-    return res.end(buf);
-  } catch (e) {
-    console.error("PFP proxy error:", e);
-    return res.status(500).send("PFP proxy error");
-  }
-});
-
-// ---- UI ---------------------------------------------------------------------
+// ---------- routes ----------
 app.get("/", (req, res) => {
   if (req.sess?.accessToken && req.sess?.username) return res.redirect("/fetch");
-  res.send(`<!doctype html><html><head><meta charset="utf-8"/>
+  res.type("html").send(`<!doctype html><html><head><meta charset="utf-8"/>
   <title>Fairscale Compass</title><meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>:root{color-scheme:dark}*{box-sizing:border-box}
   @font-face{font-family:ManropeBold;src:url('/assets/fonts/Manrope-Bold.ttf') format('truetype');font-weight:700;font-display:swap}
@@ -133,91 +130,80 @@ app.get("/", (req, res) => {
   <body><main class="wrap"><section class="container">
   <img class="logo" src="/assets/logo.png" alt="Fairscale Logo"/>
   <h1 class="title">Fairscale Compass</h1>
-  <p class="desc">Connect your X account and we’ll generate a sleek sentiment gauge from your recent posts. We’ll fetch your handle and render a preview with the needle positioned by your latest activity — perfect for demos, teasers, and social sharing.</p>
+  <p class="desc">Connect your X account and we’ll generate a sleek sentiment gauge from your recent posts, then render a server-side PNG you can download/share.</p>
   <a class="cta" href="/login"><span class="x">𝕏</span> Connect with X</a>
   <p class="fine">By continuing you agree to simulate non-production scores.</p>
   </section></main></body></html>`);
 });
 
-// ---- OAuth start ------------------------------------------------------------
-app.get("/login", async (req, res) => {
+// OAuth start
+app.get("/login", (req, res) => {
   const { url, codeVerifier, state } = oauthClient.generateOAuth2AuthLink(CALLBACK_URL, {
     scope: ["tweet.read", "users.read", "offline.access"],
   });
   const sess = { ...(req.sess || {}) };
-  sess.state = state;
-  sess.codeVerifier = codeVerifier;
+  sess.state = state; sess.codeVerifier = codeVerifier;
   res.saveSess(sess);
+  slog("OAuth start", { state, redirect: url.slice(0, 90) + "…" });
   res.redirect(url);
 });
 
-// ---- OAuth callback ---------------------------------------------------------
+// OAuth callback
 app.get("/callback", async (req, res) => {
   const { state, code } = req.query;
   if (!state || !code || state !== req.sess?.state) return res.status(400).send("Invalid OAuth2 callback");
   try {
     const { client, accessToken, refreshToken, expiresIn, scope } = await oauthClient.loginWithOAuth2({
-      code,
-      codeVerifier: req.sess.codeVerifier,
-      redirectUri: CALLBACK_URL,
+      code, codeVerifier: req.sess.codeVerifier, redirectUri: CALLBACK_URL,
     });
-
     const sess = { ...(req.sess || {}) };
-    sess.accessToken = accessToken;
-    sess.refreshToken = refreshToken;
-    sess.expiresIn = expiresIn;
-    sess.scope = scope;
+    sess.accessToken = accessToken; sess.refreshToken = refreshToken; sess.expiresIn = expiresIn; sess.scope = scope;
 
-    // One call to X to get username/id
-    if (!sess.username || !sess.userId) {
-      try {
-        const me = await client.v2.me();
-        sess.userId = me.data.id;
-        sess.username = me.data.username;
-      } catch (e) {
-        console.error("v2.me() failed:", e?.code || e?.message || e);
-        return res.status(429).send("Twitter rate limit hit while fetching your username. Please retry later.");
-      }
+    try {
+      const me = await client.v2.me();
+      sess.userId = me.data.id; sess.username = me.data.username;
+      slog("v2.me()", { id: sess.userId, username: sess.username });
+    } catch (e) {
+      slog("v2.me() failed", String(e?.message || e));
+      return res.status(429).send("Twitter rate limit while fetching your username. Try again later.");
     }
 
-    // Pull profile picture via twitterapi.io (cached in cookie)
+    // PFP via twitterapi.io
     try {
       const infoUrl = new URL("https://api.twitterapi.io/twitter/user/info");
       infoUrl.searchParams.set("userName", sess.username);
       const infoResp = await fetch(infoUrl.toString(), {
-        method: "GET",
         headers: { "x-api-key": TWITTERAPI_IO_KEY, accept: "application/json" },
       });
+      slog("twitterapi.io user/info", { status: infoResp.status });
       if (infoResp.ok) {
-        const info = await infoResp.json().catch(() => ({}));
+        const info = await infoResp.json().catch(()=> ({}));
         let pfp = info?.data?.profilePicture || "";
-        if (pfp && typeof pfp === "string" && pfp.includes("_normal")) pfp = pfp.replace("_normal", "_400x400");
-        if (pfp) sess.profileImageUrl = pfp;
+        if (pfp && pfp.includes("_normal")) pfp = pfp.replace("_normal","_400x400");
+        if (pfp) { sess.profileImageUrl = pfp; slog("PFP set", { pfp }); }
         if (info?.data?.id) sess.userId = info.data.id;
-      } else {
-        console.warn("twitterapi.io /twitter/user/info failed:", infoResp.status);
       }
     } catch (e) {
-      console.warn("twitterapi.io /twitter/user/info error:", e);
+      slog("twitterapi.io user/info error", String(e));
     }
 
     res.saveSess(sess);
     res.redirect("/fetch");
   } catch (e) {
-    console.error("OAuth2 callback error:", e);
+    slog("OAuth callback error", String(e?.message || e));
     res.status(500).send("Callback failed");
   }
 });
 
-// ---- Fetch tweets, call webhook, render gauge page --------------------------
+// Fetch tweets → webhook → compute score → redirect to preview
 app.get("/fetch", async (req, res) => {
   if (!req.sess?.accessToken || !req.sess?.username) return res.redirect("/login");
 
   const desired = Math.max(1, Number(TWEET_COUNT) || 50);
   const includeReplies = String(INCLUDE_REPLIES).toLowerCase() === "true";
+  slog("/fetch begin", { user: req.sess.username, desired, includeReplies });
 
   try {
-    // Tweets via twitterapi.io (no direct X REST after login)
     const collected = [];
     let cursor = "";
     while (collected.length < desired) {
@@ -226,21 +212,21 @@ app.get("/fetch", async (req, res) => {
       url.searchParams.set("includeReplies", includeReplies ? "true" : "false");
       if (cursor) url.searchParams.set("cursor", cursor);
 
+      slog("last_tweets request", { cursor: cursor || "<first>" });
       const resp = await fetch(url.toString(), {
-        method: "GET",
         headers: { "x-api-key": TWITTERAPI_IO_KEY, accept: "application/json" },
       });
-      if (!resp.ok) throw new Error(`TwitterAPI.io error ${resp.status}: ${await resp.text().catch(() => "")}`);
-
+      if (!resp.ok) throw new Error(`TwitterAPI.io ${resp.status}`);
       const data = await resp.json();
       const page = Array.isArray(data.data?.tweets) ? data.data.tweets : [];
-      if (page.length === 0) break;
       collected.push(...page);
+      slog("last_tweets page", { got: page.length, total: collected.length, has_next: !!data.has_next_page });
       if (!data.has_next_page || !data.next_cursor) break;
       cursor = data.next_cursor;
     }
 
     const tweetsToSend = collected.slice(0, desired);
+    slog("POST webhook", { url: WEBHOOK_URL, tweets: tweetsToSend.length });
 
     const webhookResp = await fetch(WEBHOOK_URL, {
       method: "POST",
@@ -252,196 +238,224 @@ app.get("/fetch", async (req, res) => {
         source: "twitterapi.io",
       }),
     });
-
     const bodyText = await webhookResp.text();
+    slog("Webhook response", { status: webhookResp.status, length: bodyText.length, preview: bodyText.slice(0, 240) });
 
-    // Parse webhook response -> compute displayScore (0..100)
+    // compute score
     let displayScore = null;
     try {
       const parsedAny = JSON.parse(bodyText);
       let P = 0, Neut = 0, Neg = 0;
       if (Array.isArray(parsedAny)) {
         for (const obj of parsedAny) {
-          if (obj && typeof obj === "object") {
-            if (typeof obj.Positive === "number") P += obj.Positive;
-            if (typeof obj.Neutral === "number") Neut += obj.Neutral;
-            if (typeof obj.Negative === "number") Neg += obj.Negative;
-          }
+          if (!obj || typeof obj !== "object") continue;
+          if (typeof obj.Positive === "number") P += obj.Positive;
+          if (typeof obj.Neutral === "number")  Neut += obj.Neutral;
+          if (typeof obj.Negative === "number") Neg += obj.Negative;
         }
       } else if (typeof parsedAny === "object") {
         if (typeof parsedAny.Positive === "number") P = parsedAny.Positive;
-        if (typeof parsedAny.Neutral === "number") Neut = parsedAny.Neutral;
+        if (typeof parsedAny.Neutral === "number")  Neut = parsedAny.Neutral;
         if (typeof parsedAny.Negative === "number") Neg = parsedAny.Negative;
       }
       const T = P + Neut + Neg || tweetsToSend.length || 0;
       if (T > 0) displayScore = Math.round(((P - Neg + T) / (2 * T)) * 100);
     } catch {
-      console.log(`Webhook response (raw): ${bodyText}`);
+      // ignore parse errors (we already logged preview)
     }
 
-    if (displayScore !== null) {
-      const envLeft = intish(GAUGE_LEFT, 0);
-      const envRight = intish(GAUGE_RIGHT, 0);
-      const envTop = intish(GAUGE_TOP, 0);
-      const envBottom = intish(GAUGE_BOTTOM, 0);
+    const sess = { ...(req.sess || {}) };
+    sess.lastScore = displayScore;
+    res.saveSess(sess);
 
-      const tSB = Math.max(0, Math.min(100, intish(THRESH_SB, 20)));
-      const tB  = Math.max(tSB, Math.min(100, intish(THRESH_B, 40)));
-      const tN  = Math.max(tB,  Math.min(100, intish(THRESH_N, 60)));
-      const tBU = Math.max(tN,  Math.min(100, intish(THRESH_BU, 80)));
-
-      const needleScale = Math.max(0.1, Number(NEEDLE_LEN_SCALE) || 1.0);
-      const needleWidthFrac = Math.max(0.003, Number(NEEDLE_WIDTH_FRAC) || 0.025);
-
-      const s = Math.max(0, Math.min(100, displayScore));
-      let bgFile = "strongly-bearish.png";
-      if (s >= tSB && s < tB)   bgFile = "bearish.png";
-      else if (s >= tB && s < tN)  bgFile = "neutral.png";
-      else if (s >= tN && s < tBU) bgFile = "bullish.png";
-      else if (s >= tBU)           bgFile = "strongly-bullish.png";
-      const bgPath = `/assets/${bgFile}`;
-
-      const PFP = {
-        x: intish(PFP_X, 32),
-        y: intish(PFP_Y, 32),
-        size: Math.max(1, intish(PFP_SIZE, 96)),
-      };
-      const HANDLE = {
-        x: intish(HANDLE_X, 144),
-        y: intish(HANDLE_Y, 48),
-        fontPx: Math.max(8, intish(HANDLE_FONT_PX, 36)),
-        color: String(HANDLE_COLOR || "#ffffff"),
-      };
-
-      const username = req.sess.username || "";
-      const hasPfp = Boolean(req.sess.profileImageUrl);
-
-      return res.send(`<!doctype html>
-<html><head><meta charset="utf-8"/><title>Fairscale Compass — Gauge</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<style>:root{color-scheme:dark}
-@font-face{font-family:ManropeBold;src:url('/assets/fonts/Manrope-Bold.ttf') format('truetype');font-weight:700;font-display:swap}
-body{background:#0f0f10;color:#e8e6e6;font-family:ManropeBold,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px}
-.wrap{max-width:1000px;margin:0 auto;text-align:center}
-#stage{width:100%;height:auto;display:block;margin:0 auto}
-.btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:18px}
-button,a.btn{font-size:15px;padding:10px 16px;border:1px solid #2a2a2a;border-radius:10px;background:#1a1a1b;color:#e6e6e6;cursor:pointer;text-decoration:none}
-button:hover,a.btn:hover{background:#222}</style></head>
-<body>
-  <div class="wrap">
-    <canvas id="stage"></canvas>
-    <div class="btns">
-      <button id="downloadPng">Download</button>
-      <a class="btn" href="/logout">Logout</a>
-    </div>
-  </div>
-
-<script>(async function(){
-  const value = Math.max(0, Math.min(100, ${displayScore}));
-  const CFG = {
-    left: ${envLeft},
-    right: ${envRight},
-    top: ${envTop},
-    bottom: ${envBottom},
-    needleScale: ${needleScale},
-    needleWidthFrac: ${needleWidthFrac},
-    bg: ${JSON.stringify(bgPath)},
-    pfp: { present: ${hasPfp ? "true" : "false"}, url: "/pfp", x: ${PFP.x}, y: ${PFP.y}, size: ${PFP.size} },
-    handle: { text: ${JSON.stringify('@' + username)}, x: ${HANDLE.x}, y: ${HANDLE.y}, fontPx: ${HANDLE.fontPx}, color: ${JSON.stringify(HANDLE.color)} }
-  };
-
-  const C_RED='rgb(217,83,79)', C_ORG='rgb(240,173,78)', C_GRN='rgb(92,184,92)';
-  const canvas=document.getElementById('stage'); const ctx=canvas.getContext('2d');
-
-  try{ await document.fonts.load('700 '+CFG.handle.fontPx+'px ManropeBold'); }catch(e){}
-
-  const bg=new Image(); bg.src=CFG.bg;
-  const pfp=new Image(); if(CFG.pfp.present){ pfp.crossOrigin='anonymous'; pfp.src=CFG.pfp.url; }
-
-  await new Promise(r=>{ bg.onload=r; bg.onerror=r; });
-  await new Promise(r=>{ if(!CFG.pfp.present) return r(); pfp.onload=r; pfp.onerror=r; });
-
-  canvas.width=bg.naturalWidth||bg.width; canvas.height=bg.naturalHeight||bg.height;
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  ctx.drawImage(bg,0,0,canvas.width,canvas.height);
-
-  if(CFG.pfp.present && pfp.width && pfp.height){
-    ctx.drawImage(pfp, CFG.pfp.x, CFG.pfp.y, CFG.pfp.size, CFG.pfp.size);
-  }
-
-  ctx.save(); ctx.fillStyle=CFG.handle.color; ctx.font='700 '+CFG.handle.fontPx+'px ManropeBold'; ctx.textBaseline='top';
-  ctx.fillText(CFG.handle.text, CFG.handle.x, CFG.handle.y); ctx.restore();
-
-  const rect={ x:CFG.left, y:CFG.top, w:Math.max(0,canvas.width-CFG.left-CFG.right), h:Math.max(0,canvas.height-CFG.top-CFG.bottom) };
-  const r=Math.max(1, Math.min(rect.w/2, rect.h)), cx=Math.round(rect.x+rect.w/2), cy=Math.round(rect.y+rect.h);
-  const trackW=Math.max(6, Math.round(r*0.11)), valueW=Math.max(4, Math.round(r*0.08)), start=Math.PI, end=2*Math.PI;
-
-  function drawTrack(){ ctx.save(); ctx.lineCap='round'; ctx.lineWidth=trackW; ctx.strokeStyle='#090f00';
-    ctx.beginPath(); ctx.arc(cx,cy,r,start,end,false); ctx.stroke(); ctx.restore(); }
-
-  function drawValue(v){
-    const thetaEnd=start+(v/100)*(end-start), capAngle=(valueW/2)/r;
-    if(thetaEnd<=start+capAngle){
-      ctx.save(); ctx.lineCap='round'; ctx.lineWidth=valueW; ctx.strokeStyle=C_RED;
-      ctx.beginPath(); ctx.arc(cx,cy,r,start,thetaEnd,false); ctx.stroke(); ctx.restore(); return;
-    }
-    ctx.save(); ctx.lineCap='round'; ctx.lineWidth=valueW; ctx.strokeStyle=C_RED;
-    ctx.beginPath(); ctx.arc(cx,cy,r,start,start+capAngle,false); ctx.stroke(); ctx.restore();
-
-    const gradStart=start+capAngle+1e-4, grad=ctx.createConicGradient(gradStart, cx, cy);
-    grad.addColorStop(0.00,C_RED); grad.addColorStop(0.50,C_ORG); grad.addColorStop(1.00,C_GRN);
-
-    ctx.save(); ctx.lineCap='butt'; ctx.lineWidth=valueW; ctx.strokeStyle=grad;
-    ctx.beginPath(); ctx.arc(cx,cy,r,start+capAngle,thetaEnd,false); ctx.stroke(); ctx.restore();
-  }
-
-  function drawNeedle(v){
-    const a=start+(v/100)*(end-start);
-    const r1d=r-Math.max(10, Math.round(r*0.30)), r2d=r+Math.max(8, Math.round(r*0.05)), mid=(r1d+r2d)/2, half=(r2d-r1d)/2;
-    const halfNew=half*CFG.needleScale, r1=mid-halfNew, r2=mid+halfNew;
-    const x1=cx+Math.cos(a)*r1, y1=cy+Math.sin(a)*r1, x2=cx+Math.cos(a)*r2, y2=cy+Math.sin(a)*r2;
-    ctx.save(); ctx.strokeStyle='#e6e6e8'; ctx.lineWidth=Math.max(2, Math.round(r*CFG.needleWidthFrac)); ctx.lineCap='round';
-    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); ctx.restore();
-  }
-
-  drawTrack(); drawValue(value); drawNeedle(value);
-
-  document.getElementById('downloadPng').addEventListener('click',()=>{
-    const url=canvas.toDataURL('image/png'); const a=document.createElement('a');
-    a.href=url; a.download='sentiment-gauge-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove();
-  });
-})();</script>
-</body></html>`);
+    if (displayScore === null) {
+      return res.type("html").send(`<p style="font-family:system-ui;color:#eee;">Sent ${tweetsToSend.length} tweets from @${req.sess.username} to webhook.</p>
+      <pre style="white-space:pre-wrap;color:#ccc;background:#111;padding:12px;border-radius:8px;">Webhook response: ${bodyText.replace(/</g,"&lt;")}</pre>
+      <p><a href="/" style="color:#9cf;">Back</a></p>`);
     }
 
-    // Fallback: show counts + webhook response
-    res.send(`<p style="font-family:system-ui;color:#eee;">Sent ${tweetsToSend.length} tweets from @${req.sess.username} to webhook.</p>
-    <pre style="white-space:pre-wrap;color:#ccc;background:#111;padding:12px;border-radius:8px;">Webhook response: ${bodyText}</pre>
-    <p><a href="/" style="color:#9cf;">Back</a></p>`);
+    res.redirect("/preview");
   } catch (e) {
-    console.error("Error fetching/sending tweets:", e);
+    slog("fetch/webhook error", String(e?.message || e));
     res.status(500).send("Failed to fetch tweets or send to webhook.");
   }
 });
 
-// ---- Logout -----------------------------------------------------------
+// Preview page (server-side image)
+app.get("/preview", (req, res) => {
+  if (!req.sess?.username) return res.redirect("/");
+  res.type("html").send(`<!doctype html><html><head><meta charset="utf-8"/>
+  <title>Gauge — Preview</title><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>:root{color-scheme:dark}*{box-sizing:border-box}
+  body{margin:0;background:#0f0f10;color:#e6e6e6;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{min-height:100vh;display:grid;place-items:center;padding:24px;text-align:center}
+  img{max-width:100%;height:auto;border-radius:12px;border:1px solid #222;background:#111}
+  .row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:16px}
+  .btn{padding:10px 16px;border-radius:999px;border:1px solid #2a2a2a;background:#1a1a1b;color:#e6e6e6;text-decoration:none}
+  .btn:hover{background:#222}</style></head>
+  <body><main class="wrap">
+    <div>
+      <h2>Preview for @${req.sess.username}</h2>
+      <img src="/gauge" alt="Gauge"/>
+      <div class="row">
+        <a class="btn" href="/gauge?download=1">Download PNG</a>
+        <a class="btn" href="/logout">Logout</a>
+      </div>
+    </div>
+  </main></body></html>`);
+});
+
+// Gauge image endpoint (PNG)
+app.get("/gauge", async (req, res) => {
+  if (!req.sess?.username) return res.redirect("/");
+  try {
+    const buf = await renderGaugeBuffer(req.sess);
+    if (req.query.download === "1") {
+      res.setHeader("Content-Disposition", 'attachment; filename="sentiment-gauge.png"');
+    }
+    res.setHeader("Content-Type", "image/png");
+    res.end(buf);
+  } catch (e) {
+    slog("gauge render error", String(e?.message || e));
+    res.status(500).send("Gauge render failed");
+  }
+});
+
+// logout
 app.get("/logout", (req, res) => {
-  res.cookie(COOKIE_NAME, "", {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: true,
-    signed: true,
-    path: "/",
-    maxAge: 0,
-  });
+  res.cookie(COOKIE_NAME, "", { httpOnly: true, sameSite: "lax", secure: true, signed: true, path: "/", maxAge: 0 });
   res.redirect("/");
 });
 
-/* ------------------------ Export / Run modes ------------------------- */
+// ------------- server-side renderer -------------
+async function renderGaugeBuffer(sess) {
+  const {
+    username = "",
+    profileImageUrl = "",
+    lastScore = 50,
+  } = sess || {};
+
+  // thresholds
+  const tSB = Math.max(0, Math.min(100, intish(THRESH_SB, 20)));
+  const tB  = Math.max(tSB, Math.min(100, intish(THRESH_B, 40)));
+  const tN  = Math.max(tB,  Math.min(100, intish(THRESH_N, 60)));
+  const tBU = Math.max(tN,  Math.min(100, intish(THRESH_BU, 80)));
+  const s = Math.max(0, Math.min(100, Number(lastScore) || 0));
+
+  let bgFile = "strongly-bearish.png";
+  if (s >= tSB && s < tB)   bgFile = "bearish.png";
+  else if (s >= tB && s < tN)  bgFile = "neutral.png";
+  else if (s >= tN && s < tBU) bgFile = "bullish.png";
+  else if (s >= tBU)           bgFile = "strongly-bullish.png";
+  const bgPath = path.join(process.cwd(), "assets", bgFile);
+
+  slog("Background chosen", { score: s, bgFile });
+
+  // load background first to get size
+  const bg = await loadImage(bgPath);
+  const W = bg.width, H = bg.height;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  // draw background
+  ctx.drawImage(bg, 0, 0, W, H);
+
+  // draw pfp (if available)
+  if (profileImageUrl) {
+    try {
+      const pfpResp = await fetch(profileImageUrl, { redirect: "follow", headers: { "User-Agent": "Fairscale-Compass/1.0" } });
+      if (pfpResp.ok) {
+        const pfpBuf = Buffer.from(await pfpResp.arrayBuffer());
+        const pfpImg = await loadImage(pfpBuf);
+        const PFP = {
+          x: intish(PFP_X, 32),
+          y: intish(PFP_Y, 32),
+          size: Math.max(1, intish(PFP_SIZE, 96)),
+        };
+        ctx.drawImage(pfpImg, PFP.x, PFP.y, PFP.size, PFP.size);
+      } else {
+        slog("PFP fetch failed", { status: pfpResp.status });
+      }
+    } catch (e) {
+      slog("PFP fetch error", String(e));
+    }
+  }
+
+  // handle text
+  try {
+    ctx.fillStyle = String(HANDLE_COLOR || "#ffffff");
+    const px = Math.max(8, intish(HANDLE_FONT_PX, 36));
+    ctx.font = `${px}px Manrope`;
+    ctx.textBaseline = "top";
+    ctx.fillText(`@${username}`, intish(HANDLE_X, 144), intish(HANDLE_Y, 48));
+  } catch (e) {
+    slog("handle draw error", String(e));
+  }
+
+  // gauge needle
+  try {
+    const envLeft = intish(GAUGE_LEFT, 0);
+    const envRight = intish(GAUGE_RIGHT, 0);
+    const envTop = intish(GAUGE_TOP, 0);
+    const envBottom = intish(GAUGE_BOTTOM, 0);
+
+    const rect = {
+      x: envLeft,
+      y: envTop,
+      w: Math.max(0, W - envLeft - envRight),
+      h: Math.max(0, H - envTop - envBottom),
+    };
+    const r = Math.max(1, Math.min(rect.w/2, rect.h));
+    const cx = Math.round(rect.x + rect.w / 2);
+    const cy = Math.round(rect.y + rect.h);
+
+    const needleScale = Math.max(0.1, Number(NEEDLE_LEN_SCALE) || 1.0);
+    const needleWidthFrac = Math.max(0.003, Number(NEEDLE_WIDTH_FRAC) || 0.025);
+
+    const start = Math.PI, end = 2 * Math.PI;
+    const a = start + (s/100)*(end-start);
+
+    const r1d = r - Math.max(10, Math.round(r * 0.30));
+    const r2d = r + Math.max(8,  Math.round(r * 0.05));
+    const mid = (r1d + r2d) / 2;
+    const half = (r2d - r1d) / 2;
+
+    const halfNew = half * needleScale;
+    const r1 = mid - halfNew;
+    const r2 = mid + halfNew;
+
+    const x1 = cx + Math.cos(a) * r1, y1 = cy + Math.sin(a) * r1;
+    const x2 = cx + Math.cos(a) * r2, y2 = cy + Math.sin(a) * r2;
+
+    ctx.save();
+    ctx.strokeStyle = "#e6e6e8";
+    ctx.lineWidth = Math.max(2, Math.round(r * needleWidthFrac));
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+  } catch (e) {
+    slog("needle draw error", String(e));
+  }
+
+  return canvas.toBuffer("image/png");
+}
+
+// Debug: see current cookie session (redacted)
+app.get("/debug/session", (req, res) => {
+  const s = { ...(req.sess || {}) };
+  if (s.accessToken)  s.accessToken  = `…${String(s.accessToken).slice(-6)}`;
+  if (s.refreshToken) s.refreshToken = `…${String(s.refreshToken).slice(-6)}`;
+  res.type("json").send(JSON.stringify(s, null, 2));
+});
+
+// ------------- export / run -------------
 // For Vercel / serverless:
 export default app;
 
 // For local / Docker / Kubernetes, uncomment:
 // app.listen(Number(PORT), () => {
-//   console.log(`Server running: http://localhost:${Number(PORT)}`);
+//   slog(`Server running: http://localhost:${Number(PORT)}`);
 // });
