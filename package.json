@@ -1,17 +1,12 @@
 {
-  "name": "fairscale-compass-vercel",
+  "name": "fairscale-compass-ssr",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vercel dev --listen 3000",
-    "build": "echo \"Vercel builds serverless automatically\"",
-    "start": "node api/index.mjs"
+    "dev": "vercel dev --listen 3000"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "iron-session": "^8.0.4",
-    "serverless-http": "^3.2.0",
+    "@napi-rs/canvas": "^0.1.59",
     "twitter-api-v2": "^1.16.0"
   },
   "devDependencies": {
