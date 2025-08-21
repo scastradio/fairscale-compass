@@ -2,9 +2,19 @@
   "name": "fairscale-compass-vercel",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
+  "scripts": {
+    "dev": "vercel dev --listen 3000",
+    "build": "echo \"Vercel builds serverless automatically\"",
+    "start": "node api/index.mjs"
+  },
   "dependencies": {
-    "cookie": "^0.6.0",
-    "twitter-api-v2": "^1.17.2"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "iron-session": "^8.0.4",
+    "serverless-http": "^3.2.0",
+    "twitter-api-v2": "^1.16.0"
+  },
+  "devDependencies": {
+    "vercel": "^39.1.0"
   }
 }
