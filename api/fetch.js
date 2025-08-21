@@ -6,7 +6,18 @@ function intish(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
+// --- tiny debug helpers (also used server-side headers) ---
+function dbgFlag(req) {
+  const q = new URL(req.url, `https://${req.headers.host}`);
+  return q.searchParams.get("debug") === "1" || process.env.DEBUG === "1";
+}
+function rid() { return Math.random().toString(36).slice(2, 10); }
+
 export default async function handler(req, res) {
+  const DEBUG = dbgFlag(req);
+  const reqId = rid();
+  res.setHeader("x-debug-id", reqId);
+
   const {
     TWITTERAPI_IO_KEY,
     WEBHOOK_URL,
@@ -101,7 +112,7 @@ export default async function handler(req, res) {
       const T = P + Neut + Neg || tweetsToSend.length || 0;
       if (T > 0) displayScore = Math.round(((P - Neg + T) / (2 * T)) * 100);
     } catch {
-      console.log(`Webhook response (raw): ${bodyText}`);
+      // non-JSON webhook; will fall back to plain page below
     }
 
     if (displayScore !== null) {
@@ -148,7 +159,9 @@ body{background:#0f0f10;color:#e8e6e6;font-family:ManropeBold,system-ui,-apple-s
 #stage{width:100%;height:auto;display:block;margin:0 auto}
 .btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:18px}
 button,a.btn{font-size:15px;padding:10px 16px;border:1px solid #2a2a2a;border-radius:10px;background:#1a1a1b;color:#e6e6e6;cursor:pointer;text-decoration:none}
-button:hover,a.btn:hover{background:#222}</style></head>
+button:hover,a.btn:hover{background:#222}
+pre#panel{position:fixed;bottom:8px;left:8px;max-width:60vw;max-height:40vh;overflow:auto;background:#111;color:#9cf;padding:8px;border-radius:8px;font:12px/1.4 monospace;opacity:.9;text-align:left}
+</style></head>
 <body>
   <div class="wrap">
     <canvas id="stage"></canvas>
@@ -156,6 +169,7 @@ button:hover,a.btn:hover{background:#222}</style></head>
       <button id="downloadPng">Download</button>
       <a class="btn" href="/logout">Logout</a>
     </div>
+    <pre id="panel">[debug panel]\\n</pre>
   </div>
 
 <script>(async function(){
@@ -168,42 +182,206 @@ button:hover,a.btn:hover{background:#222}</style></head>
     handle: { text: ${JSON.stringify('@' + username)}, x: ${HANDLE.x}, y: ${HANDLE.y}, fontPx: ${HANDLE.fontPx}, color: ${JSON.stringify(HANDLE.color)} }
   };
 
-  const C_RED='rgb(217,83,79)', C_ORG='rgb(240,173,78)', C_GRN='rgb(92,184,92)';
-  const canvas=document.getElementById('stage'); const ctx=canvas.getContext('2d');
-  try{ await document.fonts.load('700 '+CFG.handle.fontPx+'px ManropeBold'); }catch(e){}
-  const bg=new Image(); bg.src=CFG.bg;
-  const pfp=new Image(); if(CFG.pfp.present){ pfp.crossOrigin='anonymous'; pfp.src=CFG.pfp.url; }
-  await new Promise(r=>{bg.onload=r;bg.onerror=r}); await new Promise(r=>{if(!CFG.pfp.present)return r(); pfp.onload=r; pfp.onerror=r;});
-  canvas.width=bg.naturalWidth||bg.width; canvas.height=bg.naturalHeight||bg.height;
-  ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(bg,0,0,canvas.width,canvas.height);
-  if(CFG.pfp.present&&pfp.width&&pfp.height){ ctx.drawImage(pfp,CFG.pfp.x,CFG.pfp.y,CFG.pfp.size,CFG.pfp.size); }
-  ctx.save(); ctx.fillStyle=CFG.handle.color; ctx.font='700 '+CFG.handle.fontPx+'px ManropeBold'; ctx.textBaseline='top'; ctx.fillText(CFG.handle.text,CFG.handle.x,CFG.handle.y); ctx.restore();
-  const rect={ x:CFG.left, y:CFG.top, w:Math.max(0,canvas.width-CFG.left-CFG.right), h:Math.max(0,canvas.height-CFG.top-CFG.bottom) };
-  const r=Math.max(1,Math.min(rect.w/2,rect.h)), cx=Math.round(rect.x+rect.w/2), cy=Math.round(rect.y+rect.h);
-  const trackW=Math.max(6,Math.round(r*0.11)), valueW=Math.max(4,Math.round(r*0.08)); const start=Math.PI, end=2*Math.PI;
+  const panel = document.getElementById('panel');
+  const log = (...a)=>{ try{ console.log("[gauge]", ...a); panel.textContent += a.map(x=>typeof x==='object'?JSON.stringify(x):String(x)).join(' ') + "\\n"; }catch{} };
 
-  function drawTrack(){ ctx.save(); ctx.lineCap='round'; ctx.lineWidth=trackW; ctx.strokeStyle='#090f00'; ctx.beginPath(); ctx.arc(cx,cy,r,start,end,false); ctx.stroke(); ctx.restore(); }
-  function drawValue(v){
-    const thetaEnd = start + (v/100)*(end-start); const capAngle=(valueW/2)/r;
-    if(thetaEnd<=start+capAngle){ ctx.save(); ctx.lineCap='round'; ctx.lineWidth=valueW; ctx.strokeStyle=C_RED; ctx.beginPath(); ctx.arc(cx,cy,r,start,thetaEnd,false); ctx.stroke(); ctx.restore(); return; }
-    ctx.save(); ctx.lineCap='round'; ctx.lineWidth=valueW; ctx.strokeStyle=C_RED; ctx.beginPath(); ctx.arc(cx,cy,r,start,start+capAngle,false); ctx.stroke(); ctx.restore();
-    const gradStart=start+capAngle+1e-4; const grad=ctx.createConicGradient(gradStart,cx,cy); grad.addColorStop(0.00,C_RED); grad.addColorStop(0.50,C_ORG); grad.addColorStop(1.00,C_GRN);
-    ctx.save(); ctx.lineCap='butt'; ctx.lineWidth=valueW; ctx.strokeStyle=grad; ctx.beginPath(); ctx.arc(cx,cy,r,start+capAngle,thetaEnd,false); ctx.stroke(); ctx.restore();
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d');
+
+  try { await document.fonts.load('700 ' + CFG.handle.fontPx + 'px ManropeBold'); } catch(e){ log("font load err", e); }
+
+  const bg = new Image();
+  bg.src = CFG.bg;
+
+  const pfp = new Image();
+  if (CFG.pfp.present) {
+    pfp.crossOrigin = 'anonymous';
+    pfp.src = CFG.pfp.url;
   }
-  function drawNeedle(v){
-    const a=start+(v/100)*(end-start);
-    const r1d=r-Math.max(10,Math.round(r*0.30)), r2d=r+Math.max(8,Math.round(r*0.05)), mid=(r1d+r2d)/2, half=(r2d-r1d)/2;
-    const halfNew=half*CFG.needleScale, r1=mid-halfNew, r2=mid+halfNew;
-    const x1=cx+Math.cos(a)*r1, y1=cy+Math.sin(a)*r1, x2=cx+Math.cos(a)*r2, y2=cy+Math.sin(a)*r2;
-    ctx.save(); ctx.strokeStyle='#e6e6e8'; ctx.lineWidth=Math.max(2,Math.round(r*CFG.needleWidthFrac)); ctx.lineCap='round'; ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); ctx.restore();
+
+  await new Promise((resolve)=>{ bg.onload = ()=>{log("bg loaded", bg.naturalWidth, bg.naturalHeight, CFG.bg); resolve();}; bg.onerror = (e)=>{log("bg error", e, CFG.bg); resolve();}; });
+  await new Promise((resolve)=>{ if(!CFG.pfp.present){return resolve();} pfp.onload = ()=>{log("pfp loaded", pfp.naturalWidth, pfp.naturalHeight); resolve();}; pfp.onerror = (e)=>{log("pfp error", e); resolve();}; });
+
+  // Fallback if bg had no intrinsic size
+  if (!bg.naturalWidth || !bg.naturalHeight) {
+    // Try to set a safe default so we can at least draw the gauge
+    canvas.width = 1200; canvas.height = 628;
+    log("bg zero-size; using fallback canvas", canvas.width, canvas.height);
+  } else {
+    canvas.width = bg.naturalWidth || bg.width;
+    canvas.height = bg.naturalHeight || bg.height;
   }
-  drawTrack(); drawValue(value); drawNeedle(value);
-  document.getElementById('downloadPng').addEventListener('click',()=>{ const url=canvas.toDataURL('image/png'); const a=document.createElement('a'); a.href=url; a.download='sentiment-gauge-'+Date.now()+'.png'; document.body.appendChild(a); a.click(); a.remove(); });
+
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if (bg.naturalWidth && bg.naturalHeight) {
+    ctx.drawImage(bg, 0, 0, canvas.width, canvas.height);
+  } else {
+    // gradient fallback background if image missing
+    const g = ctx.createLinearGradient(0,0,0,canvas.height);
+    g.addColorStop(0,'#101010'); g.addColorStop(1,'#1b1b1b');
+    ctx.fillStyle = g; ctx.fillRect(0,0,canvas.width,canvas.height);
+  }
+
+  try {
+    if (CFG.pfp.present && pfp.width && pfp.height) {
+      ctx.drawImage(pfp, CFG.pfp.x, CFG.pfp.y, CFG.pfp.size, CFG.pfp.size);
+    }
+
+    ctx.save();
+    ctx.fillStyle = CFG.handle.color;
+    ctx.font = '700 ' + CFG.handle.fontPx + 'px ManropeBold';
+    ctx.textBaseline = 'top';
+    ctx.fillText(CFG.handle.text, CFG.handle.x, CFG.handle.y);
+    ctx.restore();
+
+    const rect = {
+      x: CFG.left,
+      y: CFG.top,
+      w: Math.max(0, canvas.width - CFG.left - CFG.right),
+      h: Math.max(0, canvas.height - CFG.top - CFG.bottom),
+    };
+
+    const r = Math.max(1, Math.min(rect.w / 2, rect.h));
+    const cx = Math.round(rect.x + rect.w / 2);
+    const cy = Math.round(rect.y + rect.h);
+
+    const trackW = Math.max(6, Math.round(r * 0.11));
+    const valueW = Math.max(4, Math.round(r * 0.08));
+    const start = Math.PI;
+    const end = 2 * Math.PI;
+
+    function drawTrack(){
+      ctx.save();
+      ctx.lineCap='round';
+      ctx.lineWidth=trackW;
+      ctx.strokeStyle='#090f00';
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, start, end, false);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawValue(v){
+      const C_RED = 'rgb(217,83,79)';
+      const C_ORG = 'rgb(240,173,78)';
+      const C_GRN = 'rgb(92,184,92)';
+
+      const thetaEnd = start + (v/100)*(end-start);
+      const capAngle = (valueW/2) / r;
+
+      // If conic gradients supported, use them. Otherwise, simple 3-arc fallback.
+      const canConic = typeof ctx.createConicGradient === "function";
+
+      if (!canConic) {
+        // red segment
+        ctx.save(); ctx.lineCap='round'; ctx.lineWidth=valueW; ctx.strokeStyle=C_RED;
+        ctx.beginPath(); ctx.arc(cx,cy,r,start, Math.min(start + (end-start)*0.33, thetaEnd), false); ctx.stroke(); ctx.restore();
+
+        // orange segment
+        if (thetaEnd > start + (end-start)*0.33) {
+          ctx.save(); ctx.lineCap='butt'; ctx.lineWidth=valueW; ctx.strokeStyle=C_ORG;
+          ctx.beginPath(); ctx.arc(cx,cy,r, start + (end-start)*0.33, Math.min(start + (end-start)*0.66, thetaEnd), false); ctx.stroke(); ctx.restore();
+        }
+        // green segment
+        if (thetaEnd > start + (end-start)*0.66) {
+          ctx.save(); ctx.lineCap='butt'; ctx.lineWidth=valueW; ctx.strokeStyle=C_GRN;
+          ctx.beginPath(); ctx.arc(cx,cy,r, start + (end-start)*0.66, thetaEnd, false); ctx.stroke(); ctx.restore();
+        }
+        return;
+      }
+
+      // Original gradient path
+      if (thetaEnd <= start + capAngle) {
+        ctx.save();
+        ctx.lineCap='round';
+        ctx.lineWidth=valueW;
+        ctx.strokeStyle=C_RED;
+        ctx.beginPath();
+        ctx.arc(cx,cy,r,start,thetaEnd,false);
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+
+      ctx.save();
+      ctx.lineCap='round';
+      ctx.lineWidth=valueW;
+      ctx.strokeStyle=C_RED;
+      ctx.beginPath();
+      ctx.arc(cx,cy,r,start,start+capAngle,false);
+      ctx.stroke();
+      ctx.restore();
+
+      const gradStart = start + capAngle + 1e-4;
+      const grad = ctx.createConicGradient(gradStart, cx, cy);
+      grad.addColorStop(0.00,  C_RED);
+      grad.addColorStop(0.50,  C_ORG);
+      grad.addColorStop(1.00,  C_GRN);
+
+      ctx.save();
+      ctx.lineCap='butt';
+      ctx.lineWidth=valueW;
+      ctx.strokeStyle=grad;
+      ctx.beginPath();
+      ctx.arc(cx,cy,r,start+capAngle,thetaEnd,false);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawNeedle(v){
+      const a = start + (v/100)*(end-start);
+
+      const r1_def = r - Math.max(10, Math.round(r * 0.30));
+      const r2_def = r + Math.max(8,  Math.round(r * 0.05));
+      const mid_def = (r1_def + r2_def) / 2;
+      const halfLen_def = (r2_def - r1_def) / 2;
+
+      const halfLen_new = halfLen_def * CFG.needleScale;
+      const r1 = mid_def - halfLen_new;
+      const r2 = mid_def + halfLen_new;
+
+      const x1 = cx + Math.cos(a) * r1, y1 = cy + Math.sin(a) * r1;
+      const x2 = cx + Math.cos(a) * r2, y2 = cy + Math.sin(a) * r2;
+
+      ctx.save();
+      ctx.strokeStyle='#e6e6e8';
+      ctx.lineWidth = Math.max(2, Math.round(r * CFG.needleWidthFrac));
+      ctx.lineCap='round';
+      ctx.beginPath();
+      ctx.moveTo(x1,y1);
+      ctx.lineTo(x2,y2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    drawTrack();
+    drawValue(value);
+    drawNeedle(value);
+    log("draw complete", { value, canvas: { w: canvas.width, h: canvas.height } });
+
+    document.getElementById('downloadPng').addEventListener('click',()=>{
+      try{
+        const url = canvas.toDataURL('image/png');
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'sentiment-gauge-' + Date.now() + '.png';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }catch(e){ log("download error", e); }
+    });
+
+    window.addEventListener("error", (e)=> log("window.error", e.message || e));
+    window.addEventListener("unhandledrejection", (e)=> log("promise.rejection", e.reason || e));
+  } catch (e) {
+    log("fatal draw error", e && (e.stack || e.message || e));
+  }
 })();</script>
 </body></html>`);
       return;
     }
 
+    // No score -> show webhook output so you can debug upstream
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.end(`<p style="font-family:system-ui;color:#eee;">Sent ${tweetsToSend.length} tweets from @${sess.username} to webhook.</p>
 <pre style="white-space:pre-wrap;color:#ccc;background:#111;padding:12px;border-radius:8px;">Webhook response: ${bodyText}</pre>
